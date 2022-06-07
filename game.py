@@ -4,200 +4,137 @@ from dataclasses import dataclass, field
 from itertools import product, permutations
 from typing import Tuple, List, Set, Union, Optional
 from copy import deepcopy
-
+from numba import njit
 from time import time
 
+import numpy as np
 
 BOARD_SIZE = 9
 BLOCK_SIZE = 3
 
-@dataclass
-class Figure:
-    shape: Tuple[Tuple[int]] = field(default_factory=tuple)
-    size: Tuple[int] = field(init=False)
-    mass: int = field(init=False)
 
-    def __post_init__(self):
-        self.size = (len(self.shape), len(self.shape[0]))
-        self.mass = sum(sum(row) for row in self.shape)
+@njit(cache=True)
+def np_all_axis0(x):
+    out = np.ones(x.shape[1], dtype=np.bool8)
+    for i in range(x.shape[0]):
+        out = np.logical_and(out, x[i, :])
+    return out
 
-    def __getitem__(self, pos: Tuple[int, int]) -> int:
-        i, j = pos
-        return self.shape[i][j]
+@njit(cache=True)
+def np_all_axis1(x):
+    out = np.ones(x.shape[0], dtype=np.bool8)
+    for i in range(x.shape[1]):
+        out = np.logical_and(out, x[:, i])
+    return out
 
-    def __hash__(self):
-        # return hash(tuple(tuple(tile for tile in row) for row in self.shape))
-        return hash(self.shape)
+@njit
+def does_figure_fits(board: np.array, figure: np.array, i: int, j: int) -> bool:
+    if (BOARD_SIZE - figure.shape[0] < i) or (BOARD_SIZE - figure.shape[1] < j):
+        return False
+    board_slice = board[i:i+figure.shape[0], j:j+figure.shape[1]]
+    return np.all(board_slice + figure <= 1)
 
-    def __str__(self) -> str:
-        output = '\n'.join(
-            ' '.join('X' if tile else '.' for tile in row)
-            for row in self.shape
-        )
-        return output
+@njit
+def possible_figure_places(board: np.array, figure: np.array) -> List[Tuple[int, int]]:
+    possible_places = [
+        (i, j)
+        for i in range(BOARD_SIZE)
+        for j in range(BOARD_SIZE)
+        if does_figure_fits(board, figure, i, j)
+    ]
+    return possible_places
 
-@dataclass
-class FigureSet:
-    storage: List[Figure] = field(default_factory=list)
-    n_figures: int = field(init=False)
+@njit
+def add_figure(board: np.array, figure: np.array, i: int, j: int) -> np.array:
+    new_board = board.copy()
+    new_board[i:i+figure.shape[0], j:j+figure.shape[1]] += figure
+    return new_board
 
-    def __post_init__(self):
-        self.n_figures = len(self.storage)
+@njit
+def update(board: np.array) -> np.array:
+    full_cols = np_all_axis0(board)
+    full_rows = np_all_axis1(board)
+    full_blocks = [
+        (bi, bj)
+        for bi in range(BOARD_SIZE // BLOCK_SIZE)
+        for bj in range(BOARD_SIZE // BLOCK_SIZE)
+        if np.all(board[
+            bi*BLOCK_SIZE:(bi+1)*BLOCK_SIZE,
+            bj*BLOCK_SIZE:(bj+1)*BLOCK_SIZE
+        ])
+    ]
+    new_board = board.copy()
+    new_board[:, full_cols] = 0
+    new_board[full_rows, :] = 0
+    for (bi, bj) in full_blocks:
+        new_board[
+            bi*BLOCK_SIZE:(bi+1)*BLOCK_SIZE,
+            bj*BLOCK_SIZE:(bj+1)*BLOCK_SIZE
+        ] = 0
+    return new_board
 
-    def __getitem__(self, key: int) -> Figure:
-        return self.storage[key]
-
-    @staticmethod
-    def load(path) -> 'FigureSet':
-        with open(path, 'r') as f:
-            raw_data = f.read().strip()
-        figures = [
-            Figure(
-                shape=tuple(
-                    tuple(
-                        int(raw_tile)
-                        for raw_tile in raw_row.split(' ')
-                    )
-                    for raw_row in raw_figure.split('\n')
-                )
-            )
-            for raw_figure in raw_data.split('\n\n')
+@njit
+def possible_outcomes(start_board: np.array, ordered_figures: List[np.array]) -> np.array:
+    possibilities = [start_board]
+    for next_figure in ordered_figures:
+        possibilities = [
+            update(add_figure(board, next_figure, i, j))
+            for board in possibilities
+            for i, j in possible_figure_places(board, next_figure)
         ]
-        return FigureSet(figures)
-
-    def sample(self, n) -> List[Figure]:
-        return random.choices(self.storage, k=n)
-
-@dataclass
-class BoardState:
-    state: Tuple[Tuple[int]] = field(
-        default_factory=lambda: tuple(tuple(0 for j in range(BOARD_SIZE)) for i in range(BOARD_SIZE))
-    )
-
-    def __str__(self) -> str:
-        output = '\n'.join(
-            ' '.join('X' if tile else '.' for tile in row)
-            for row in self.state
-        )
-        return output
-
-    def __getitem__(self, pos: Tuple[int, int]) -> int:
-        i, j = pos
-        return self.state[i][j]
-
-    def __setitem__(self, pos: Tuple[int, int], value: int):
-        i, j = pos
-        self.state[i][j] = value
-
-    def does_figure_fits(self, figure: Figure, i: int, j: int) -> bool:
-        if (BOARD_SIZE - figure.size[0] < i) or (BOARD_SIZE - figure.size[1] < j):
-            return False
-        for fi, fj in product(range(figure.size[0]), range(figure.size[1])):
-            figure_tile = figure[fi, fj]
-            board_tile = self[fi+i, fj+j]
-            if figure_tile and board_tile:
-                return False
-        return True
-
-    def possible_figure_places(self, figure: Figure) -> List[Tuple[int, int]]:
-        possible_places = [
-            (i, j)
-            for (i, j) in product(range(BOARD_SIZE), range(BOARD_SIZE))
-            if self.does_figure_fits(figure, i, j)
-        ]
-        return possible_places
-
-    def add_figure(self, figure: Figure, fi: int, fj: int) -> 'BoardState':
-        new_state = tuple(
-            tuple(
-                self[i, j] + figure[i-fi, j-fj]
-                if (fi <= i < fi+figure.size[0]) and (fj <= j < fj+figure.size[1])
-                else self[i, j]
-                for j in range(BOARD_SIZE)
-            )
-            for i in range(BOARD_SIZE)
-        )
-        return BoardState(new_state)
-
-    def update(self) -> 'BoardState':
-        full_rows = {
-            i for i in range(BOARD_SIZE)
-            if all(self[i, j] for j in range(BOARD_SIZE))
-        }
-        full_cols = {
-            j for j in range(BOARD_SIZE)
-            if all(self[i, j] for i in range(BOARD_SIZE))
-        }
-        full_blocks = {
-            (bi, bj) for (bi, bj) in product(range(BOARD_SIZE // BLOCK_SIZE),
-                                             range(BOARD_SIZE // BLOCK_SIZE))
-            if all(
-                self[bi*BLOCK_SIZE+i, bj*BLOCK_SIZE+j]
-                for i, j in product(range(BLOCK_SIZE), range(BLOCK_SIZE))
-            )
-        }
-        new_state = tuple(
-            tuple(
-                0
-                if (i in full_rows) or (j in full_cols) or ((i // 3, j // 3) in full_blocks)
-                else self[i, j]
-                for j in range(BOARD_SIZE)
-            )
-            for i in range(BOARD_SIZE)
-        )
-        # multiplier = len(full_rows) + len(full_cols) + len(full_blocks)
-        return BoardState(new_state)
+    return possibilities
 
 
 class Game(object):
 
     def __init__(self):
-        self.figure_set = FigureSet.load('data/figures')
-        self.current_board_state = BoardState()
-        self.current_score = 0
-        self.current_round = 0
+        self.figure_set = self.load_figure_set('data/figures')
+        self.current_board = np.zeros((BOARD_SIZE, BOARD_SIZE), np.int8)
 
-        self.current_series_multiplier = 1
+    def reset(self):
+        self.current_board = np.zeros((BOARD_SIZE, BOARD_SIZE), np.int8)
 
-    def get_new_figures(self, n: int=3, seed: int=0) -> List[Figure]:
-        random.seed(seed)
-        return self.figure_set.sample(n)
+    def load_figure_set(self, path: str):
+        with open(path, 'r') as f:
+            data = f.read().strip()
+        figures = [
+            np.array([
+                [int(tile_str) for tile_str in row_str.split(' ')]
+                for row_str in figure_str.split('\n')
+            ])
+            for figure_str in data.split('\n\n')
+        ]
+        return figures
 
-    def possible_outcomes(self, three_figures: List[Figure]):
-        figures_orders = {p for p in permutations(three_figures)}
+    def get_new_figures(self, k: int=3, seed: int=None) -> List[np.array]:
+        if seed:
+            random.seed(seed)
+        return random.choices(self.figure_set, k=k)
 
-        possibilities = []
-        for order in figures_orders:
-            current_order_possibilities = [(self.current_board_state, [])]
-            for figure in order:
-                t1 = time()
-                current_order_possibilities = [
-                    (
-                        prev_board.add_figure(figure, i, j),
-                        prev_history + [(figure, i, j)]
-                    )
-                    for prev_board, prev_history in current_order_possibilities
-                    for i, j in prev_board.possible_figure_places(figure)
-                ]
-                t2 = time()
-                print(f'{(t2 - t1):.3f} sec')
-            possibilities += current_order_possibilities
-
-        return possibilities
+    def round_results(self, new_figures):
+        round_outcomes = [
+            outcome
+            for order in permutations(new_figures)
+            for outcome in possible_outcomes(self.current_board, order)
+        ]
+        return round_outcomes
 
 
-    def update(self, new_board, upscore):
-        pass
 
 
 if __name__ == '__main__':
     g = Game()
-    nf = g.get_new_figures(3, seed=1)
-    for f in nf:
-        print(f)
-        print()
-    po = g.possible_outcomes(nf)
-    print(len(po))
-    po_1_board = po[5000][0]
-    print(po_1_board)
-
+    for game_number in range(10):
+        g.reset()
+        print(f'Game {game_number}')
+        for round_number in range(100):
+            t1 = time()
+            nf = g.get_new_figures(3)
+            po = g.round_results(nf)
+            t2 = time()
+            print(f'Round {round_number}: {t2-t1:.3f} sec. Possible outcomes: {len(po)}')
+            if po:
+                new_board = random.choice(po)
+                g.current_board = new_board
+            else:
+                break
