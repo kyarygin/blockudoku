@@ -1,19 +1,29 @@
-import random
-
 from dataclasses import dataclass, field
 from itertools import product, permutations
-from typing import Tuple, List, Set, Union, Optional
+from collections import Counter
 from copy import deepcopy
 from numba import njit
 from time import time
 from tqdm import tqdm
 
 import numpy as np
-from collections import Counter
+import random
+
+from strategy import Strategy, random_strategy, nn_strategy
+
+from typing import Tuple, List, Set, Union, Optional, NewType
+from typing_extensions import Literal
+
 
 BOARD_SIZE = 9
 BLOCK_SIZE = 3
 
+def draw(input: np.array):
+    output = '\n'.join([
+        ' '.join('X' if x else '.' for x in row)
+        for row in input
+    ])
+    print(output)
 
 @njit(cache=True)
 def np_all_axis0(x):
@@ -84,11 +94,10 @@ def possible_outcomes(start_board: np.array, ordered_figures: List[np.array]) ->
             for board in possibilities
             for i, j in possible_figure_places(board, next_figure)
         ]
-    return possibilities
+    return possibilities[:]
 
 
 class Game(object):
-
     def __init__(self):
         self.figure_set = self.load_figure_set('game_data/figures')
         self.current_board = np.zeros((BOARD_SIZE, BOARD_SIZE), np.int8)
@@ -111,29 +120,29 @@ class Game(object):
     def get_new_figures(self, k: int=3) -> List[np.array]:
         return random.choices(self.figure_set, k=k)
 
-    def round_results(self, new_figures):
+    def round(self,
+              strategy: Strategy,
+              search_type: Literal['full', 'beam']='full'):
+        new_figures = self.get_new_figures(3)
         round_outcomes = [
             outcome
             for order in permutations(new_figures)
             for outcome in possible_outcomes(self.current_board, order)
         ]
-        return round_outcomes
-
-    def random_round(self):
-        new_figures = self.get_new_figures(3)
-        for figure in new_figures:
-            ij_list = possible_figure_places(self.current_board, figure)
-            if not ij_list:
-                return False
-            i, j = random.choice(ij_list)
-            self.current_board = add_figure(self.current_board, figure, i, j)
+        if not round_outcomes:
+            return False
+        best_outcome_idx = strategy.best_state(np.stack(round_outcomes))
+        self.current_board = round_outcomes[best_outcome_idx]
         return True
 
-    def random_game(self):
+    def game(self, strategy: Strategy) -> Tuple[np.array, np.array]:
         self.reset()
         game_states = []
         for i_round in range(1000):
-            round_result = self.random_round()
+            t1 = time()
+            round_result = self.round(strategy)
+            t2 = time()
+            print(f'Round: {i_round}, {(t2-t1):.2f} sec.')
             game_states.append(self.current_board)
             if not round_result:
                 break
@@ -142,17 +151,4 @@ class Game(object):
 
 if __name__ == '__main__':
     g = Game()
-    game_states_list = []
-    target_list = []
-    for i in tqdm(range(100_000)):
-        game_states, target = g.random_game()
-        game_states_list.append(game_states)
-        target_list.append(target)
-    X = np.concatenate(game_states_list)
-    y = np.concatenate(target_list)
-    print(X.shape)
-    print(y.shape)
-    with open('train_data/X.npy', 'wb') as f:
-        np.save(f, X)
-    with open('train_data/y.npy', 'wb') as f:
-        np.save(f, y)
+    g.game(nn_strategy)
